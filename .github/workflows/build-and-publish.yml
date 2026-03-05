@@ -1,0 +1,254 @@
+name: Build Fedora Asahi Remix (KIWI) + Publish installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      fedora_release:
+        description: "Fedora release number (e.g. 43)"
+        required: true
+        default: "43"
+      kiwi_branch:
+        description: "Upstream kiwi-descriptions branch (e.g. f43)"
+        required: true
+        default: "f43"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build packages (${{ matrix.profile }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        profile:
+          - Minimal
+          - Server
+          - Workstation-GNOME
+          - Workstation-KDE
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Host deps (podman + qemu-user-static/binfmt)
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y podman qemu-user-static binfmt-support git jq unzip zip
+          # Make sure binfmt handlers are active (runner images differ a bit)
+          sudo systemctl restart systemd-binfmt.service || true
+          sudo update-binfmts --enable qemu-aarch64 || true
+          update-binfmts --display qemu-aarch64 || true
+
+      - name: Clone upstream kiwi-descriptions
+        env:
+          KIWI_BRANCH: ${{ inputs.kiwi_branch }}
+        run: |
+          set -euo pipefail
+          rm -rf kiwi-descriptions
+          git clone --depth=1 --branch "${KIWI_BRANCH}" https://pagure.io/fedora-asahi/kiwi-descriptions.git kiwi-descriptions
+
+      - name: Build ${{ matrix.profile }} in aarch64 Fedora container (via QEMU)
+        env:
+          FEDORA_RELEASE: ${{ inputs.fedora_release }}
+          PROFILE: ${{ matrix.profile }}
+        run: |
+          set -euo pipefail
+
+          # Filename-safe profile (keep hyphens, lower-case)
+          PROFILE_FN="$(echo "${PROFILE}" | tr '[:upper:]' '[:lower:]')"
+
+          mkdir -p "${GITHUB_WORKSPACE}/out/${PROFILE_FN}"
+
+          IMAGE="registry.fedoraproject.org/fedora:${FEDORA_RELEASE}"
+
+          # Pull an aarch64 image explicitly
+          sudo podman pull --arch aarch64 "${IMAGE}"
+
+          # Run build
+          sudo podman run --privileged --rm \
+            -v "${GITHUB_WORKSPACE}/kiwi-descriptions:/code" \
+            -v "${GITHUB_WORKSPACE}/out/${PROFILE_FN}:/out" \
+            -w /code \
+            -e FEDORA_RELEASE="${FEDORA_RELEASE}" \
+            -e PROFILE="${PROFILE}" \
+            -e PROFILE_FN="${PROFILE_FN}" \
+            "${IMAGE}" \
+            /bin/bash -lc '
+              set -euo pipefail
+
+              # EXACTLY the upstream-style deps (no kiwi-systemdeps-* guessing)
+              dnf -y install kiwi qemu-img fatcat gawk p7zip-plugins rpmdistro-repoquery util-linux zip zstd
+
+              kiwi-ng --debug --type=oem --profile="${PROFILE}" --color-output \
+                system build --description ./ --target-dir ./outdir
+
+              RAW="$(ls -1 ./outdir/*.raw | head -n 1)"
+              PKG="Fedora-Asahi-Remix-${FEDORA_RELEASE}-${PROFILE}.zip"
+
+              ./make-asahi-installer-package.sh "${RAW}" "${PKG}"
+
+              mv "${PKG}" "/out/${PKG}"
+              sha256sum "/out/${PKG}" | tee "/out/${PKG}.sha256"
+            '
+
+      - name: Upload artifact (${{ matrix.profile }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.profile }}
+          path: out/**/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release + Pages installer
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Prepare release + installer files
+        id: prep
+        env:
+          FEDORA_RELEASE: ${{ inputs.fedora_release }}
+        run: |
+          set -euo pipefail
+
+          OWNER="${GITHUB_REPOSITORY%%/*}"
+          REPO="${GITHUB_REPOSITORY##*/}"
+
+          TS="$(date -u +%Y%m%d-%H%M%S)"
+          TAG="f${FEDORA_RELEASE}-${TS}"
+
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+
+          mkdir -p release pages
+
+          # Collect packages
+          find dist -type f -name '*.zip' -maxdepth 5 -print -exec cp -v {} release/ \;
+          find dist -type f -name '*.sha256' -maxdepth 5 -print -exec cp -v {} release/ \;
+
+          # Build installer_data.json (format known to work with Asahi installer)
+          python3 - <<'PY'
+          import json, os
+
+          fedora = os.environ["FEDORA_RELEASE"]
+
+          profiles = ["Minimal", "Server", "Workstation-GNOME", "Workstation-KDE"]
+          pkgs = {p: f"Fedora-Asahi-Remix-{fedora}-{p}.zip" for p in profiles}
+
+          # Keep supported_fw list aligned with known-working examples;
+          # installer will still allow manual choices if firmware evolves.
+          supported_fw = ["13.5", "13.6", "14.6", "14.7", "15.6", "15.7"]
+
+          def os_entry(name, pkg):
+            return {
+              "name": name,
+              "boot_object": "m1n1.bin",
+              "next_object": "m1n1.bin",
+              "package": pkg,
+              "supported_fw": supported_fw,
+              "partitions": [
+                {
+                  "name": "EFI",
+                  "type": "EFI",
+                  "filesystem": "fat",
+                  "size": 536870912,
+                  "source": "esp",
+                  "copy_firmware": True,
+                  "copy_installer_data": True
+                },
+                {
+                  "name": "Boot",
+                  "type": "Linux",
+                  "filesystem": "ext4",
+                  "size": 1073741824,
+                  "image": "boot.img",
+                  "source": "boot.img"
+                },
+                {
+                  "name": "Root",
+                  "type": "Linux",
+                  "filesystem": "ext4",
+                  "size": 10737418240,
+                  "expand": True,
+                  "image": "root.img",
+                  "source": "root.img"
+                }
+              ]
+            }
+
+          data = {
+            "os_list": [
+              os_entry(f"Fedora Asahi Remix {fedora} Minimal", pkgs["Minimal"]),
+              os_entry(f"Fedora Asahi Remix {fedora} Server", pkgs["Server"]),
+              os_entry(f"Fedora Asahi Remix {fedora} Workstation (GNOME)", pkgs["Workstation-GNOME"]),
+              os_entry(f"Fedora Asahi Remix {fedora} Workstation (KDE)", pkgs["Workstation-KDE"]),
+            ],
+            "default_os_name": f"Fedora Asahi Remix {fedora} Workstation (GNOME)"
+          }
+
+          with open("release/installer_data.json", "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+          PY
+
+          # Pages "latest" pointer
+          echo "${TAG}" > pages/latest
+
+          # Pages "install" script (curl | sh entrypoint)
+          # Downloads the official Asahi installer bundle and points it at our release assets.
+          cat > pages/install <<'SH'
+          #!/bin/sh
+          set -eu
+
+          OWNER="__OWNER__"
+          REPO="__REPO__"
+          PAGES_BASE="https://${OWNER}.github.io/${REPO}"
+
+          RELEASE_TAG="$(curl -fsSL "${PAGES_BASE}/latest")"
+          REPO_BASE="https://github.com/${OWNER}/${REPO}/releases/download/${RELEASE_TAG}"
+
+          # Use upstream Asahi installer bundle, but our OS metadata + packages
+          export INSTALLER_DATA="${REPO_BASE}/installer_data.json"
+          export REPO_BASE="${REPO_BASE}"
+
+          VERSION_FLAG="https://cdn.asahilinux.org/installer/latest"
+          INSTALLER_BASE="https://cdn.asahilinux.org/installer"
+
+          PKG_VER="$(curl -fsSL "${VERSION_FLAG}")"
+          TMP="$(mktemp -d 2>/dev/null || mktemp -d -t asahi-installer)"
+          trap 'rm -rf "${TMP}"' EXIT
+
+          curl -fsSL "${INSTALLER_BASE}/installer-${PKG_VER}.tar.gz" | tar -xz -C "${TMP}"
+          exec "${TMP}/install.sh"
+          SH
+
+          # Replace placeholders
+          sed -i "s/__OWNER__/${OWNER}/g; s/__REPO__/${REPO}/g" pages/install
+          chmod +x pages/install
+
+      - name: Create GitHub Release (assets = packages + installer_data.json)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.prep.outputs.tag }}
+          name: Fedora Asahi Remix build ${{ steps.prep.outputs.tag }}
+          files: |
+            release/*.zip
+            release/*.sha256
+            release/installer_data.json
+
+      - name: Publish Pages (install + latest)
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: pages
+          force_orphan: true
